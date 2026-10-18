@@ -184,6 +184,52 @@ export function loadObjFromString(objText: string, name: string = 'model.obj'): 
 }
 
 /**
+ * Validates an STL ArrayBuffer before parsing to prevent RangeErrors and invalid allocations
+ */
+export function validateStlBuffer(buffer: ArrayBuffer, name: string = 'model.stl'): void {
+  if (buffer.byteLength === 0) {
+    throw new Error(`The STL file '${name}' is empty (0 bytes).`);
+  }
+
+  // Check for HTML error response (e.g. 404 page returned as 200)
+  const headBytes = new Uint8Array(buffer.slice(0, Math.min(buffer.byteLength, 150)));
+  const headText = new TextDecoder().decode(headBytes);
+
+  if (headText.includes('<!DOCTYPE') || headText.includes('<html') || headText.includes('404: Not Found')) {
+    throw new Error(`Server returned an HTML error page instead of 3D model data for '${name}'.`);
+  }
+
+  if (buffer.byteLength < 84) {
+    if (!headText.trim().toLowerCase().startsWith('solid')) {
+      throw new Error(`The file '${name}' is too small (${buffer.byteLength} bytes) and is not a valid STL.`);
+    }
+    return;
+  }
+
+  // Check if ASCII STL
+  const isAscii = headText.trim().toLowerCase().startsWith('solid');
+
+  if (!isAscii) {
+    const view = new DataView(buffer);
+    const faces = view.getUint32(80, true);
+    const expectedBinarySize = 84 + faces * 50;
+
+    // Detect impossibly large triangle counts (e.g. interpreting ASCII/LFS as binary)
+    if (faces > 50_000_000 || faces * 9 > 2_147_483_647) {
+      // Check if it's actually ASCII with leading spaces or metadata
+      const widerText = new TextDecoder().decode(new Uint8Array(buffer.slice(0, 300))).toLowerCase();
+      if (widerText.includes('facet') && widerText.includes('vertex')) {
+        return; // Valid ASCII STL
+      }
+
+      throw new Error(
+        `Binary STL '${name}' has invalid triangle count: ${faces.toLocaleString()} (expected ${(expectedBinarySize / (1024 * 1024)).toFixed(1)} MB, actual ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB). File may be corrupted or an LFS pointer.`
+      );
+    }
+  }
+}
+
+/**
  * Helper to parse STL from ArrayBuffer directly
  */
 export function loadStlFromBuffer(
@@ -191,6 +237,8 @@ export function loadStlFromBuffer(
   name: string = 'model.stl',
   materialColor: string = '#9BA6B2'
 ): LoadModelResult {
+  validateStlBuffer(buffer, name);
+
   const loader = new STLLoader();
   const geometry = loader.parse(buffer);
 
@@ -221,17 +269,35 @@ export function loadStlFromBuffer(
 }
 
 /**
- * Loads an STL model from a static URL (e.g. /models/WIND_TURBINE.stl)
+ * Loads an STL model from a static URL with Git LFS pointer detection and automatic resolution
  */
 export async function loadStlFromUrl(
   url: string,
   name: string = 'WIND_TURBINE.stl'
 ): Promise<{ result: LoadModelResult; size: number }> {
-  const response = await fetch(url);
+  let response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to load ${name} from ${url} (HTTP ${response.status}: ${response.statusText})`);
   }
-  const buffer = await response.arrayBuffer();
+
+  let buffer = await response.arrayBuffer();
+
+  // Inspect for Git LFS pointer text file (e.g., deployed on Vercel where git-lfs wasn't pulled)
+  const headBytes = new Uint8Array(buffer.slice(0, Math.min(buffer.byteLength, 200)));
+  const headText = new TextDecoder().decode(headBytes);
+
+  if (headText.startsWith('version https://git-lfs.github.com') || (buffer.byteLength < 500 && headText.includes('oid sha256:'))) {
+    console.warn(`[3D VISION] Static asset '${url}' is a Git LFS pointer. Resolving real binary from GitHub LFS media...`);
+    const fallbackLfsUrl = `https://media.githubusercontent.com/media/Rifaideen-prince/ALFIN_3D_MODEL/main/public/models/${name}`;
+    const lfsRes = await fetch(fallbackLfsUrl);
+    if (!lfsRes.ok) {
+      throw new Error(`Git LFS pointer detected at '${url}', but failed to fetch binary from '${fallbackLfsUrl}' (HTTP ${lfsRes.status})`);
+    }
+    buffer = await lfsRes.arrayBuffer();
+  }
+
+  validateStlBuffer(buffer, name);
+
   const size = buffer.byteLength;
   const result = loadStlFromBuffer(buffer, name, '#9BA6B2');
   return { result, size };
